@@ -83,16 +83,17 @@ composes CDC and HID into one composite device. See `platformio.ini`.
 USB CDC, in both modes. Lines are emitted only when presence changes:
 
 ```
-[+] 04A1B2C3D4E5F6 AB key=0x05 mod=0x02
+[+] 04A1B2C3D4E5F6 AB key='b' (0x62)
 [+] 04B1C2D3E4F5A6 A
-[-] 04A1B2C3D4E5F6 key=0x05 mod=0x02
+[-] 04A1B2C3D4E5F6 key='b' (0x62)
 ```
 
 - `[+] <UID> <A|B|AB>`: the UID was not previously readable; the label says
   which coil(s) answered during the round in which it appeared.
   `AB` means both coils detected the tag.
-- `key=0xNN mod=0xNN`: present for tags found in `include/keymap.h`.
-  Unregistered tags print the bare UID instead.
+- `key=...`: present for tags found in `include/keymap.h`. Printable characters
+  are quoted; non-printing keys show the raw library value, so `KEY_CAPS_LOCK`
+  appears as `key=0xC1`. Unregistered tags print the bare UID instead.
 - `[-] <UID>`: the UID was no longer readable on either coil.
 
 UIDs are uppercase hex, all bytes of NFCID1 (14 digits for the 7-byte tags in
@@ -117,17 +118,24 @@ produce a spurious `[-]` / `[+]` pair when the tag is still present.
 ## UID to key mapping
 
 The map lives in `include/keymap.h` and is intentionally empty. Add entries as
-the panel's tag UIDs become known:
+the panel's tag UIDs become known, writing keys the same way as ordinary Arduino
+keyboard code:
 
 ```cpp
 constexpr Entry ENTRIES[] = {
-    { {0x04,0xA1,0xB2,0xC3,0xD4,0xE5,0xF6}, 7, 0x05, 0x02 },  // B with Shift
+    { {0x04,0xA1,0xB2,0xC3,0xD4,0xE5,0xF6}, 7, 'b' },
+    { {0x04,0xB1,0xC2,0xD3,0xE4,0xF5,0xA6}, 7, KEY_CAPS_LOCK },
 };
 ```
 
-Fields are `uid`, `len`, `keycode`, `modifier`. Keycodes and modifier bits are
-the raw USB HID values documented at the top of that header. Every UID must be
-listed in full; there is no prefix matching.
+Fields are `uid`, `len`, `key`. Use lowercase characters for letters and digits
+(no Shift needed, one keycode slot per tag), and `KEY_*` macros from
+`HID_Keyboard.h` for keys that have no character, such as `KEY_CAPS_LOCK`,
+`KEY_F1`, `KEY_UP_ARROW` or `KEY_DELETE`. Modifier macros such as
+`KEY_LEFT_SHIFT` can be given to their own tag and are held while it is
+present; several tags sharing one modifier release it only when the last of them
+is removed. There are no `KEY_A`..`KEY_Z` macros, so letters must be characters.
+Every UID must be listed in full; there is no prefix matching.
 
 ## Boot output
 

@@ -130,27 +130,21 @@ void printUid(const uint8_t *uid, uint8_t len) {
 }
 
 // Look up a UID in the keymap. Returns false when the tag is unregistered.
-bool findKey(const uint8_t *uid, uint8_t len, uint8_t &keycode,
-             uint8_t &modifier) {
+bool findKey(const uint8_t *uid, uint8_t len, uint8_t &key) {
   for (uint8_t i = 0; i < keymap::COUNT; ++i) {
     const keymap::Entry &e = keymap::ENTRIES[i];
     if (e.len == len && memcmp(e.uid, uid, len) == 0) {
-      keycode = e.keycode;
-      modifier = e.modifier;
+      key = e.key;
       return true;
     }
   }
   return false;
 }
 
-// Encoding used by HID_Keyboard::press/release:
-//   >= 136  raw HID keycode, offset by 136 (KEY_F1 0xC2 -> keycode 0x3A)
-//   >= 128  modifier bit, 128 + bit index
-//   else    ASCII, mapped through the keyboard layout
-// The keymap stores raw HID keycodes, so convert on the way in.
-constexpr uint8_t keyToLibrary(uint8_t keycode) {
-  return static_cast<uint8_t>(keycode + 136);
-}
+// Modifier macros in HID_Keyboard.h are 0x80 + bit, so KEY_LEFT_SHIFT (0x81) is
+// bit 1 of the report's modifier byte. Anything below 0x80 is a character or a
+// non-printing KEY_* macro and carries no modifier of its own.
+constexpr bool isModifierKey(uint8_t key) { return key >= 0x80 && key <= 0x87; }
 
 // HID reports can only be sent while the host has the interface open. Asking
 // the library is expensive: Keyboard_::sendReport() waits up to 500 ms for
@@ -161,71 +155,73 @@ bool hostAcceptsReports() {
 
 // Count tags whose key is currently down. An HID boot keyboard reports at most
 // kMaxSimultaneousKeys keycodes, so further presses would be silently dropped.
+// Modifier-only tags do not occupy a keycode slot.
 uint8_t heldKeyCount() {
   uint8_t count = 0;
   for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
-    if (gTable[i].used && gTable[i].keyHeld) {
+    if (!gTable[i].used || !gTable[i].keyHeld) {
+      continue;
+    }
+    uint8_t key = 0;
+    if (findKey(gTable[i].uid, gTable[i].len, key) && !isModifierKey(key)) {
       ++count;
     }
   }
   return count;
 }
 
-// Modifiers that must stay down because some other held key still needs them.
-// Releasing the last user of a bit clears it from the report.
-uint8_t modifiersInUseExcept(uint8_t skipIndex) {
-  uint8_t inUse = 0;
+// Re-assert modifiers that other held tags still need.
+//
+// HID_Keyboard::release() clears a modifier bit unconditionally. With two tags
+// both holding KEY_LEFT_SHIFT, releasing either one would drop Shift for the
+// other, so every still-held key is pressed again afterwards. press() is
+// idempotent, so keys already in the report are left untouched and only the
+// report is resent.
+//
+// Lowercase characters such as 'b' carry no modifier of their own, so the plain
+// character case needs no fix-up; this keeps shared modifier tags working.
+void reassertModifiers() {
   for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
-    if (i == skipIndex || !gTable[i].used || !gTable[i].keyHeld) {
+    if (!gTable[i].used || !gTable[i].keyHeld) {
       continue;
     }
-    uint8_t keycode = 0;
-    uint8_t modifier = 0;
-    if (findKey(gTable[i].uid, gTable[i].len, keycode, modifier)) {
-      inUse |= modifier;
+    uint8_t key = 0;
+    if (findKey(gTable[i].uid, gTable[i].len, key)) {
+      Keyboard.press(key);
     }
   }
-  return inUse;
 }
 
 // Press a mapped key the instant its tag is detected. Returns true when the
 // report reached the host, so the caller only records the press on success.
-bool pressKey(uint8_t keycode, uint8_t modifier) {
+bool pressKey(uint8_t key) {
   if (app::DEBUG_MODE || !hostAcceptsReports()) {
     return false;
   }
-  if (heldKeyCount() >= kMaxSimultaneousKeys) {
-    return false;  // No free keycode slot in the boot keyboard report.
+  // Modifier-only tags do not consume a keycode slot.
+  if (!isModifierKey(key) && heldKeyCount() >= kMaxSimultaneousKeys) {
+    return false;
   }
-  for (uint8_t bit = 0; bit < 8; ++bit) {
-    if (modifier & (1U << bit)) {
-      Keyboard.press(static_cast<uint8_t>(128 + bit));
-    }
-  }
-  Keyboard.press(keyToLibrary(keycode));
+  Keyboard.press(key);
   return true;
 }
 
-// Release one tag's key. Modifier bits are dropped only when no other held tag
-// still needs them, so tags that share Shift do not release it early.
+// Release one tag's key, then restore modifiers that other held tags still need.
+// The held flag is cleared before reasserting so the tag being removed is not
+// pressed back.
 void releaseEntryKey(uint8_t index) {
   if (app::DEBUG_MODE || !gTable[index].keyHeld) {
     return;
   }
-  uint8_t keycode = 0;
-  uint8_t modifier = 0;
-  if (!findKey(gTable[index].uid, gTable[index].len, keycode, modifier)) {
+  gTable[index].keyHeld = false;
+  uint8_t key = 0;
+  if (!findKey(gTable[index].uid, gTable[index].len, key)) {
     return;
   }
-  Keyboard.release(keyToLibrary(keycode));
-  const uint8_t keep = modifiersInUseExcept(index);
-  for (uint8_t bit = 0; bit < 8; ++bit) {
-    const uint8_t mask = static_cast<uint8_t>(1U << bit);
-    if ((modifier & mask) && !(keep & mask)) {
-      Keyboard.release(static_cast<uint8_t>(128 + bit));
-    }
-  }
+  Keyboard.release(key);
+  reassertModifiers();
 }
+
 
 // True when log lines should be emitted. SerialUSB::operator bool() reports
 // whether the host has the CDC port connected, so a headless keyboard never
@@ -234,11 +230,22 @@ bool loggingEnabled() {
   return static_cast<bool>(Serial);
 }
 
+// Describe a keymap value for the log: the quoted character for printable
+// ASCII, otherwise the raw library value in hex (that is the KEY_* macro
+// encoding, so KEY_CAPS_LOCK shows as 0xC1).
+void printKey(uint8_t key) {
+  if (key >= 0x20 && key < 0x7F) {
+    Serial.printf("key='%c' (0x%02X)", key, key);
+  } else {
+    Serial.printf("key=0x%02X", key);
+  }
+}
+
 // One line per presence change:
-//   [+] <uid> <A|B|AB> key=0xNN mod=0xNN   mapped tag
-//   [+] <uid> <A|B|AB>                     unmapped tag, UID only
-//   [-] <uid> key=0xNN mod=0xNN            mapped tag removed
-//   [-] <uid>                              unmapped tag removed
+//   [+] <uid> <A|B|AB> key=...   mapped tag
+//   [+] <uid> <A|B|AB>           unmapped tag, UID only
+//   [-] <uid> key=...            mapped tag removed
+//   [-] <uid>                    unmapped tag removed
 void reportAdded(const TrackedUid &entry) {
   if (!loggingEnabled()) {
     return;
@@ -252,10 +259,10 @@ void reportAdded(const TrackedUid &entry) {
     Serial.print(entry.seenA ? 'A' : 'B');
   }
 
-  uint8_t keycode = 0;
-  uint8_t modifier = 0;
-  if (findKey(entry.uid, entry.len, keycode, modifier)) {
-    Serial.printf(" key=0x%02X mod=0x%02X", keycode, modifier);
+  uint8_t key = 0;
+  if (findKey(entry.uid, entry.len, key)) {
+    Serial.print(' ');
+    printKey(key);
   }
   Serial.print("\r\n");
 }
@@ -267,10 +274,10 @@ void reportRemoved(const TrackedUid &entry) {
   Serial.print("[-] ");
   printUid(entry.uid, entry.len);
 
-  uint8_t keycode = 0;
-  uint8_t modifier = 0;
-  if (findKey(entry.uid, entry.len, keycode, modifier)) {
-    Serial.printf(" key=0x%02X mod=0x%02X", keycode, modifier);
+  uint8_t key = 0;
+  if (findKey(entry.uid, entry.len, key)) {
+    Serial.print(' ');
+    printKey(key);
   }
   Serial.print("\r\n");
 }
@@ -346,10 +353,9 @@ void readAntenna(bool antennaA, SweepResult &sweep) {
           continue;  // Already down from an earlier sweep.
         }
 
-        uint8_t keycode = 0;
-        uint8_t modifier = 0;
-        if (findKey(entry.uid, entry.len, keycode, modifier)) {
-          entry.keyHeld = pressKey(keycode, modifier);
+        uint8_t key = 0;
+        if (findKey(entry.uid, entry.len, key)) {
+          entry.keyHeld = pressKey(key);
         }
       }
     }
@@ -466,10 +472,9 @@ void updatePresence(const SweepResult &sweepA, const SweepResult &sweepB) {
         ++entry.absentRounds;
       }
       if (entry.absentRounds >= app::ABSENT_ROUNDS_BEFORE_REMOVE) {
-        // Release this tag's key before forgetting the entry. Modifier bits that
-        // other held tags still need stay down.
+        // Release this tag's key before forgetting the entry. releaseEntryKey
+        // clears keyHeld and restores modifiers other held tags still need.
         releaseEntryKey(i);
-        entry.keyHeld = false;
         if (entry.reported) {
           reportRemoved(entry);
         }
