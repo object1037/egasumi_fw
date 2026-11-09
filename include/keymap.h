@@ -47,6 +47,10 @@ struct Entry {
 
 // Intentionally empty: fill in the panel's UIDs as they become known. An empty
 // table makes the reader emit no keyboard events while still logging every tag.
+//
+// The easiest way to fill it in: build with MODE = Mode::Capture, touch the tags
+// in order (a..z then 0..9), send 'd' over serial, and paste the printed ENTRIES
+// block over the one below. See README.md.
 constexpr Entry ENTRIES[] = {
     // { {0x04,0xA1,0xB2,0xC3,0xD4,0xE5,0xF6}, 7, 'b' },
     // { {0x04,0xB1,0xC2,0xD3,0xE4,0xF5,0xA6}, 7, KEY_CAPS_LOCK },

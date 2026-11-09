@@ -47,16 +47,69 @@ The resulting image is `.pio/build/pico2/firmware.uf2`.
 
 ## Modes
 
-`DEBUG_MODE` in `include/app_config.h` selects the behavior at compile time.
+`MODE` in `include/app_config.h` selects the behavior at compile time.
 
-| | `DEBUG_MODE = true` | `DEBUG_MODE = false` |
-| --- | --- | --- |
-| USB device | CDC serial only | CDC serial **and** HID keyboard |
-| Key events | never emitted | up to 6 mapped tags each hold their own key |
-| Boot | waits for a character (banner preserved) | starts immediately |
+| | `Mode::Debug` | `Mode::Capture` | `Mode::Keyboard` |
+| --- | --- | --- | --- |
+| USB device | CDC serial only | CDC serial only | CDC serial **and** HID keyboard |
+| Key events | never emitted | never emitted | up to 6 mapped tags hold their own key |
+| Boot | waits for a character | starts immediately | starts immediately |
+| Purpose | UID inventory log | record UIDs into keymap form | act as a keyboard |
 
-The keyboard device is absent from the descriptor in debug mode, so a debug
-build can never type into the host machine.
+The keyboard device is absent from the descriptor in debug and capture modes,
+so neither build can type into the host machine.
+
+### Capture mode
+
+Turns a "touch each tag once, in order" session into a keymap you can paste.
+Each newly detected tag is bound to the next key of `CAPTURE_KEYS` in
+`app_config.h`, which defaults to `a`..`z` then `0`..`9`.
+
+Workflow:
+
+1. Set `MODE = Mode::Capture`, build and upload.
+2. Touch the tag you want to be `a`. Lift it. Touch the tag for `b`, and so on.
+3. Send `d` over the serial port to print the table.
+
+The dump is plain text:
+
+```cpp
+// Capture session: 3 tag(s). Paste the ENTRIES block into include/keymap.h.
+
+constexpr Entry ENTRIES[] = {
+    { {0x04,0xA1,0xB2,0xC3,0xD4,0xE5,0xF6}, 7, 'a' },
+    { {0x04,0xB1,0xC2,0xD3,0xE4,0xF5,0xA6}, 7, 'b' },
+    { {0x04,0xC1,0xD2,0xE3,0xF4,0xA5,0xB6}, 7, 'c' },
+};
+```
+
+Copy that `ENTRIES` block over the empty one in `include/keymap.h`, switch to
+`Mode::Keyboard`, and rebuild.
+
+Serial commands, sent as single bytes:
+
+| Byte | Action |
+| --- | --- |
+| `d` | dump the pasteable table |
+| `b` | undo the last entry (wrong tag, or touched twice) |
+| `r` | restart the session at the first key |
+
+A tag already recorded is ignored, so leaving a tag on the reader never
+consumes extra key slots. `b` and `r` also re-arm tags still resting on the
+reader, so they take effect without lifting anything.
+
+Only one tag at a time, please: with two tags in the field the assigned order is
+whatever the sweep happens to see first.
+
+The dump is written straight to the serial port, so RF polling pauses for as
+long as the host takes to drain it. That is fine for a one-off dump and keeps
+the recording loop free of buffering code.
+
+Each tag prints a line as it is recorded:
+
+```
+# capture 1/36 -> 'a' 04A1B2C3D4E5F6
+```
 
 ### Keyboard mode
 
@@ -143,7 +196,7 @@ At boot the firmware prints the ST25R300 IC ID, the differential antenna mode
 result, the NFCA poller initialization result, and a rough amplitude/phase
 measurement for each antenna.
 
-With `WAIT_FOR_SERIAL_INPUT` enabled (the default, tied to `DEBUG_MODE`),
+With `WAIT_FOR_SERIAL_INPUT` enabled (the default in `Mode::Debug` only),
 nothing is printed and RF does not start until the host sends any character.
 Open the serial monitor and press Enter once; the banner then appears in full
 instead of being lost to a port that was not attached yet.

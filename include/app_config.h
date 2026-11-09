@@ -30,17 +30,42 @@ constexpr bool ENABLE_RF_DIAGNOSTICS = true;
 
 // Master mode switch.
 //
-//  true  - debug: no keyboard device, and the boot wait blocks until the host
-//          sends a character so the banner is not lost.
-//  false - keyboard: the board enumerates as a USB HID keyboard and presses the
-//          mapped key while a registered tag is present.
-constexpr bool DEBUG_MODE = true;
+//   Debug    - RF log only. No keyboard device, and the boot wait blocks until
+//              the host sends a character so the banner is not lost.
+//   Capture  - RF log plus a keystroke recorder. No keyboard device either, so
+//              it cannot type into the host. Each newly detected tag is bound to
+//              the next key of CAPTURE_KEYS, and the table can be dumped through
+//              the serial port as text that pastes into keymap.h.
+//   Keyboard - the board enumerates as a USB HID keyboard and holds the mapped
+//              key while a registered tag is present.
+enum class Mode { Debug, Capture, Keyboard };
+
+constexpr Mode MODE = Mode::Capture;
+
+// True in the mode that enumerates a HID keyboard. Both other modes keep the
+// board serial-only, so a debug or capture build links no HID code at all.
+constexpr bool KEYBOARD_MODE = MODE == Mode::Keyboard;
 
 // When true, setup() prints nothing until the host sends any character. This
 // keeps the boot banner from being lost before a serial monitor attaches.
-// While active, RF does not start until the host responds either. Only
-// meaningful in debug mode; keyboard mode never blocks on serial input.
-constexpr bool WAIT_FOR_SERIAL_INPUT = DEBUG_MODE;
+// While active, RF does not start until the host responds either. Only used by
+// debug mode; capture and keyboard modes never block on serial input.
+constexpr bool WAIT_FOR_SERIAL_INPUT = MODE == Mode::Debug;
+
+// Key sequence used by capture mode. Touch the tags in this order and each one
+// is bound to the next key. Lowercase letters need no Shift, so every tag takes
+// exactly one keycode slot in the resulting table.
+constexpr uint8_t CAPTURE_KEYS[] = {
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+};
+constexpr uint8_t CAPTURE_KEY_COUNT =
+    sizeof(CAPTURE_KEYS) / sizeof(CAPTURE_KEYS[0]);
+
+// Most tags a capture session can record. Bounds the buffer the pasteable
+// table is rendered into, so it must stay below CAPTURE_KEY_COUNT's reach.
+constexpr uint8_t MAX_CAPTURED_UIDS = CAPTURE_KEY_COUNT;
 
 // Wait up to this long for the USB serial host before starting RF.
 constexpr uint32_t USB_WAIT_MS = 1500;
