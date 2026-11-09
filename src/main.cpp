@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <cstring>
 #include <hardware/gpio.h>
 
 #include "app_config.h"
@@ -14,12 +15,39 @@ RfalRfST25R500Class rfReader(&SPI, board::PIN_SPI_CS, board::PIN_IRQ,
                              board::PIN_RF_RESET, app::SPI_SPEED_HZ);
 RfalNfcClass nfc(&rfReader);
 
+// Tags found by the most recent sweep of one antenna. Only this array is
+// handed to RFAL; presence tracking lives in gTable.
 rfalNfcaListenDevice gTags[app::MAX_TAGS];
 
-// Worst case: antenna letter + (space + 10-byte UID) per tag + CRLF.
-constexpr size_t kLineSize =
-    1 + app::MAX_TAGS * (1 + 2 * RFAL_NFCA_CASCADE_3_UID_LEN) + 2;
-char gLine[kLineSize];
+constexpr uint8_t kMaxUidLen = RFAL_NFCA_CASCADE_3_UID_LEN;
+
+struct TrackedUid {
+  bool used;
+  bool seenA;           // present on coil A in the round being processed
+  bool seenB;           // present on coil B in the round being processed
+  bool reported;        // at least one [+] line has been emitted
+  bool lastReportedA;   // coil A presence carried by the last [+] line
+  bool lastReportedB;   // coil B presence carried by the last [+] line
+  uint8_t len;
+  uint8_t absentRounds;
+  uint8_t uid[kMaxUidLen];
+};
+
+static_assert(app::MAX_TRACKED_UIDS >= app::MAX_TAGS,
+              "tracking table must hold at least one full sweep");
+
+TrackedUid gTable[app::MAX_TRACKED_UIDS];
+
+// Presence accumulated by the current A+B round. Each tag is stored as a
+// length byte followed by that many UID bytes, indexed by count.
+constexpr uint16_t kSweepBytes = (app::MAX_TAGS * (kMaxUidLen + 1)) + 1;
+struct SweepResult {
+  uint8_t count;
+  uint8_t tags[kSweepBytes];
+};
+
+SweepResult gSweepA;
+SweepResult gSweepB;
 
 constexpr char kHex[] = "0123456789ABCDEF";
 
@@ -53,41 +81,109 @@ bool isNoTagOrRecoverable(ReturnCode err) {
   }
 }
 
-void emitSweep(bool antennaA, uint8_t count, ReturnCode err) {
-  if (!Serial) {
+void appendUid(SweepResult &sweep, const uint8_t *uid, uint8_t len) {
+  if (sweep.count >= app::MAX_TAGS) {
+    return;
+  }
+  if (len == 0U || len > kMaxUidLen) {
+    return;
+  }
+  uint8_t *p = &sweep.tags[sweep.count * (kMaxUidLen + 1)];
+  *p++ = len;
+  memcpy(p, uid, len);
+  ++sweep.count;
+}
+
+// Locate a UID in the tracking table, or return MAX_TRACKED_UIDS.
+uint8_t findEntry(const uint8_t *uid, uint8_t len) {
+  for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
+    if (gTable[i].used && gTable[i].len == len &&
+        memcmp(gTable[i].uid, uid, len) == 0) {
+      return i;
+    }
+  }
+  return app::MAX_TRACKED_UIDS;
+}
+
+// Returns the new entry index, or MAX_TRACKED_UIDS when the table is full.
+uint8_t allocEntry() {
+  for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
+    if (!gTable[i].used) {
+      return i;
+    }
+  }
+  return app::MAX_TRACKED_UIDS;
+}
+
+void printUid(const uint8_t *uid, uint8_t len) {
+  for (uint8_t b = 0; b < len; ++b) {
+    Serial.write(kHex[uid[b] >> 4]);
+    Serial.write(kHex[uid[b] & 0x0FU]);
+  }
+}
+
+void reportAdded(const TrackedUid &entry) {
+  Serial.print("[+] ");
+  printUid(entry.uid, entry.len);
+  Serial.print(' ');
+  if (entry.seenA && entry.seenB) {
+    Serial.print("AB");
+  } else {
+    Serial.print(entry.seenA ? 'A' : 'B');
+  }
+  Serial.print("\r\n");
+}
+
+void reportRemoved(const TrackedUid &entry) {
+  Serial.print("[-] ");
+  printUid(entry.uid, entry.len);
+  Serial.print("\r\n");
+}
+
+// Emit a line for every non-recoverable sweep error. Recovery errors just
+// mean the antenna saw no answer.
+void reportSweepError(ReturnCode err) {
+  if (err != ERR_NONE && !isNoTagOrRecoverable(err)) {
+    Serial.printf("err %d\r\n", static_cast<int>(err));
+  }
+}
+
+void readAntenna(bool antennaA, SweepResult &sweep) {
+  sweep.count = 0;
+
+  // The field is turned off at the end of every sweep, so the antenna path can
+  // be changed here without another field-off transaction.
+  selectAntenna(antennaA);
+
+  ReturnCode err = rfReader.rfalFieldOnAndStartGT();
+  if (err != ERR_NONE) {
+    rfReader.rfalFieldOff();
+    reportSweepError(err);
     return;
   }
 
-  const char antenna = antennaA ? 'A' : 'B';
+  while (!rfReader.rfalIsGTExpired()) {
+    yield();
+  }
 
-  if (count == 0) {
-    if (isNoTagOrRecoverable(err)) {
-      Serial.printf("%c -\r\n", antenna);
-    } else {
-      Serial.printf("%c !%d\r\n", antenna, static_cast<int>(err));
+  uint8_t count = 0;
+  err = nfc.rfalNfcaPollerFullCollisionResolution(
+      RFAL_COMPLIANCE_MODE_NFC, app::MAX_TAGS, gTags, &count);
+
+  rfReader.rfalFieldOff();
+
+  if (count > 0U) {
+    for (uint8_t i = 0; i < count; ++i) {
+      uint8_t len = gTags[i].nfcId1Len;
+      if (len > kMaxUidLen) {
+        len = kMaxUidLen;
+      }
+      appendUid(sweep, gTags[i].nfcId1, len);
     }
     return;
   }
 
-  char *p = gLine;
-  *p++ = antenna;
-
-  for (uint8_t i = 0; i < count; ++i) {
-    *p++ = ' ';
-    uint8_t len = gTags[i].nfcId1Len;
-    if (len > RFAL_NFCA_CASCADE_3_UID_LEN) {
-      len = RFAL_NFCA_CASCADE_3_UID_LEN;
-    }
-    for (uint8_t b = 0; b < len; ++b) {
-      const uint8_t value = gTags[i].nfcId1[b];
-      *p++ = kHex[value >> 4];
-      *p++ = kHex[value & 0x0FU];
-    }
-  }
-
-  *p++ = '\r';
-  *p++ = '\n';
-  Serial.write(gLine, static_cast<size_t>(p - gLine));
+  reportSweepError(err);
 }
 
 void measureAntenna(bool antennaA) {
@@ -129,6 +225,92 @@ bool initializeReader() {
     delay(500);
   }
   return false;
+}
+
+// Reconcile the completed A+B round against the tracking table.
+//
+// Both sweeps are known before any line is emitted, so a tag present on both
+// coils is reported once as "AB" instead of first as "A" and then again.
+void updatePresence(const SweepResult &sweepA, const SweepResult &sweepB) {
+  if (!Serial) {
+    return;
+  }
+
+  // 1. Mark everything seen on either antenna and age out everything missing.
+  //    New UIDs are recorded but stay unreported until their label is known.
+  //    Clear last round's flags first: absent entries are identified by "!seenA
+  //    && !seenB", so stale true bits would keep a removed tag alive forever.
+  for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
+    gTable[i].seenA = false;
+    gTable[i].seenB = false;
+  }
+
+  for (const SweepResult *sweep : {&sweepA, &sweepB}) {
+    const bool onA = (sweep == &sweepA);
+
+    for (uint8_t i = 0; i < sweep->count; ++i) {
+      const uint8_t *p = &sweep->tags[i * (kMaxUidLen + 1)];
+      const uint8_t len = *p;
+
+      uint8_t idx = findEntry(p + 1, len);
+      if (idx == app::MAX_TRACKED_UIDS) {
+        idx = allocEntry();
+        if (idx == app::MAX_TRACKED_UIDS) {
+          continue;  // Table full; skip rather than corrupt tracking state.
+        }
+        TrackedUid &fresh = gTable[idx];
+        fresh = TrackedUid{};
+        fresh.used = true;
+        fresh.len = len;
+        memcpy(fresh.uid, p + 1, len);
+        fresh.reported = false;
+        fresh.absentRounds = 0;
+      }
+
+      TrackedUid &entry = gTable[idx];
+      if (onA) {
+        entry.seenA = true;
+      } else {
+        entry.seenB = true;
+      }
+      entry.absentRounds = 0;
+    }
+  }
+
+  // 2. Report additions and coil changes, then drop entries missing too long.
+  for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
+    TrackedUid &entry = gTable[i];
+    if (!entry.used) {
+      continue;
+    }
+
+    const bool seenNow = entry.seenA || entry.seenB;
+
+    if (!seenNow) {
+      if (entry.absentRounds < UINT8_MAX) {
+        ++entry.absentRounds;
+      }
+      if (entry.absentRounds >= app::ABSENT_ROUNDS_BEFORE_REMOVE) {
+        if (entry.reported) {
+          reportRemoved(entry);
+        }
+        entry.used = false;
+      }
+      continue;
+    }
+
+    if (!entry.reported || entry.lastReportedA != entry.seenA ||
+        entry.lastReportedB != entry.seenB) {
+      // First sighting, or the tag appeared/disappeared on a coil.
+      reportAdded(entry);
+      entry.reported = true;
+      entry.lastReportedA = entry.seenA;
+      entry.lastReportedB = entry.seenB;
+    }
+
+    entry.seenA = false;
+    entry.seenB = false;
+  }
 }
 
 }  // namespace
@@ -194,29 +376,7 @@ void setup() {
 }
 
 void loop() {
-  for (uint8_t i = 0; i < 2; ++i) {
-    const bool antennaA = (i == 0);
-
-    // The field is turned off at the end of every sweep, so the antenna path
-    // can be changed here without another field-off transaction.
-    selectAntenna(antennaA);
-
-    ReturnCode err = rfReader.rfalFieldOnAndStartGT();
-    if (err != ERR_NONE) {
-      rfReader.rfalFieldOff();
-      emitSweep(antennaA, 0, err);
-      continue;
-    }
-
-    while (!rfReader.rfalIsGTExpired()) {
-      yield();
-    }
-
-    uint8_t count = 0;
-    err = nfc.rfalNfcaPollerFullCollisionResolution(
-        RFAL_COMPLIANCE_MODE_NFC, app::MAX_TAGS, gTags, &count);
-
-    rfReader.rfalFieldOff();
-    emitSweep(antennaA, count, err);
-  }
+  readAntenna(true, gSweepA);
+  readAntenna(false, gSweepB);
+  updatePresence(gSweepA, gSweepB);
 }

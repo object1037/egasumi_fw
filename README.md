@@ -6,6 +6,9 @@ The reader continuously inventories ISO/IEC 14443 Type A / NFC Forum Type 2
 tags on two antenna coils. It performs a full UID collision resolution on
 antenna A, then on antenna B, and repeats. No tag memory is read or written.
 
+Output is an event log rather than a per-sweep dump: one line when a UID first
+appears, one line when it stops being readable on either coil.
+
 ## Hardware
 
 | Signal | Pico 2 GPIO |
@@ -44,19 +47,35 @@ The resulting image is `.pio/build/pico2/firmware.uf2`.
 
 ## Serial output
 
-USB CDC, one line per antenna sweep:
+USB CDC. Lines are emitted only when presence changes:
 
 ```
-A 04A1B2C3D4E5F6 04B1C2D3E4F5A6
-B -
-A !4
+[+] 04A1B2C3D4E5F6 AB
+[+] 04B1C2D3E4F5A6 A
+[-] 04A1B2C3D4E5F6
 ```
 
-- `A` / `B`: antenna that was swept.
-- UID: uppercase hex, one token per tag, all bytes of NFCID1
-  (7 bytes for the tags in use).
-- `-`: no tag found.
-- `!<rc>`: non-recoverable RFAL return code.
+- `[+] <UID> <A|B|AB>`: the UID was not previously readable; the label says
+  which coil(s) answered during the round in which it appeared.
+  `AB` means both coils detected the tag.
+- `[-] <UID>`: the UID was no longer readable on either coil.
+- UID is uppercase hex, all bytes of NFCID1 (14 digits for the 7-byte tags in
+  use).
+
+The label also re-reports a tag when its coil set changes, for example
+`AB` -> `A` as the tag moves out of coil B's field, or `A` -> `B` when it
+moves to the other coil. A tag that stays readable on the same coil set
+produces no output.
+
+`err <rc>` is printed for non-recoverable sweep errors (SPI, wrong state).
+
+### Hysteresis
+
+A UID must be missing for `ABSENT_ROUNDS_BEFORE_REMOVE` complete A+B rounds
+(default 2) before `[-]` is emitted. A single missed read therefore does not
+produce a spurious `[-]` / `[+]` pair when the tag is still present.
+
+## Boot output
 
 At boot the firmware prints the ST25R300 IC ID, the differential antenna mode
 result, the NFCA poller initialization result, and a rough amplitude/phase
@@ -69,6 +88,7 @@ measurement for each antenna.
 - NFC-A guard time after field-on: RFAL `RFAL_GT_NFCA`, 5 ms, waited once per
   field-on cycle. The RF field is off while the antenna path changes.
 - Maximum tags per sweep: 32.
+- Removal latency: up to 2 complete A+B rounds, about 240 ms with a few tags.
 
 ## Status
 
