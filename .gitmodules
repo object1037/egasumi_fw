@@ -1,0 +1,6 @@
+[submodule "lib/ST25R500"]
+	path = lib/ST25R500
+	url = https://github.com/stm32duino/ST25R500
+[submodule "lib/NFC-RFAL"]
+	path = lib/NFC-RFAL
+	url = https://github.com/stm32duino/NFC-RFAL
