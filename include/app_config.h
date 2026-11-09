@@ -40,7 +40,7 @@ constexpr bool ENABLE_RF_DIAGNOSTICS = true;
 //              key while a registered tag is present.
 enum class Mode { Debug, Capture, Keyboard };
 
-constexpr Mode MODE = Mode::Capture;
+constexpr Mode MODE = Mode::Keyboard;
 
 // True in the mode that enumerates a HID keyboard. Both other modes keep the
 // board serial-only, so a debug or capture build links no HID code at all.
