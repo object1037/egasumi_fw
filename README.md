@@ -52,7 +52,7 @@ The resulting image is `.pio/build/pico2/firmware.uf2`.
 | | `DEBUG_MODE = true` | `DEBUG_MODE = false` |
 | --- | --- | --- |
 | USB device | CDC serial only | CDC serial **and** HID keyboard |
-| Key events | never emitted | mapped tags press/hold a key |
+| Key events | never emitted | up to 6 mapped tags each hold their own key |
 | Boot | waits for a character (banner preserved) | starts immediately |
 
 The keyboard device is absent from the descriptor in debug mode, so a debug
@@ -65,11 +65,18 @@ other coil is read, so detection latency is one sweep plus one HID report. The
 key stays held while the tag remains readable and is released once the tag has
 been absent for `ABSENT_ROUNDS_BEFORE_REMOVE` complete rounds.
 
-Only one key is held at a time, matching HID boot-keyboard semantics. If two
-mapped tags are present, the first one keeps the key; the second is logged but
-ignored until the first is released.
+Pressing happens through the Arduino `Keyboard` / `HID_Keyboard` libraries, which
+drive the standard HID boot-keyboard report: six keycode slots plus one modifier
+byte. Up to six mapped tags can therefore be held at once, each with its own
+key and modifiers, and modifier bits are shared correctly — a `Shift` needed by
+two held tags stays down until the last of them is released. A seventh tag is
+logged but gets no key until a slot frees up.
 
 Unregistered tags never produce key events. They appear in the log only.
+
+The USB stack is the core's native device stack (not Adafruit TinyUSB), because
+the Arduino `Keyboard` library is incompatible with TinyUSB; the native stack
+composes CDC and HID into one composite device. See `platformio.ini`.
 
 ## Serial output
 

@@ -1,8 +1,9 @@
 #include <Arduino.h>
-#include <Adafruit_TinyUSB.h>
+#include <Keyboard.h>
 #include <SPI.h>
 #include <cstring>
 #include <hardware/gpio.h>
+#include <tusb.h>
 
 #include "app_config.h"
 #include "board_pins.h"
@@ -23,18 +24,8 @@ rfalNfcaListenDevice gTags[app::MAX_TAGS];
 
 constexpr uint8_t kMaxUidLen = RFAL_NFCA_CASCADE_3_UID_LEN;
 
-// HID keyboard. Only instantiated in keyboard mode; in debug mode the object
-// stays invalid and never adds an interface to the USB descriptor.
-const uint8_t kReportDescriptor[] = {TUD_HID_REPORT_DESC_KEYBOARD()};
-Adafruit_USBD_HID gKeyboard(kReportDescriptor, sizeof(kReportDescriptor),
-                            HID_ITF_PROTOCOL_KEYBOARD, 1 /* ms poll */);
-
-// The single key currently held. HID boot keyboards report one key at a time,
-// so a second tag cannot steal the press while another is down. The held UID is
-// remembered so only the tag that caused the press can end it.
-bool gKeyHeld = false;
-uint8_t gHeldUidLen = 0;
-uint8_t gHeldUid[kMaxUidLen];
+// Number of keycodes an HID boot keyboard can report at once.
+constexpr uint8_t kMaxSimultaneousKeys = 6;
 
 struct TrackedUid {
   bool used;
@@ -43,6 +34,7 @@ struct TrackedUid {
   bool reported;        // at least one [+] line has been emitted
   bool lastReportedA;   // coil A presence carried by the last [+] line
   bool lastReportedB;   // coil B presence carried by the last [+] line
+  bool keyHeld;         // this tag's key is currently down
   uint8_t len;
   uint8_t absentRounds;
   uint8_t uid[kMaxUidLen];
@@ -151,33 +143,92 @@ bool findKey(const uint8_t *uid, uint8_t len, uint8_t &keycode,
   return false;
 }
 
-// Send the "key held" report. Called the instant a registered tag is seen.
-void pressKey(const uint8_t *uid, uint8_t len, uint8_t keycode,
-              uint8_t modifier) {
-  if (app::DEBUG_MODE || !gKeyboard.ready()) {
-    return;
-  }
-  uint8_t keys[6] = {0};
-  keys[0] = keycode;
-  if (!gKeyboard.keyboardReport(0, modifier, keys)) {
-    return;  // Host not ready; leave the state untouched so a later try works.
-  }
-  gKeyHeld = true;
-  gHeldUidLen = len;
-  memcpy(gHeldUid, uid, len);
+// Encoding used by HID_Keyboard::press/release:
+//   >= 136  raw HID keycode, offset by 136 (KEY_F1 0xC2 -> keycode 0x3A)
+//   >= 128  modifier bit, 128 + bit index
+//   else    ASCII, mapped through the keyboard layout
+// The keymap stores raw HID keycodes, so convert on the way in.
+constexpr uint8_t keyToLibrary(uint8_t keycode) {
+  return static_cast<uint8_t>(keycode + 136);
 }
 
-// Send the all-keys-up report.
-void releaseKey() {
-  if (app::DEBUG_MODE || !gKeyboard.ready()) {
-    return;
-  }
-  gKeyboard.keyboardRelease(0);
-  gKeyHeld = false;
+// HID reports can only be sent while the host has the interface open. Asking
+// the library is expensive: Keyboard_::sendReport() waits up to 500 ms for
+// tud_hid_ready(), which would stall the RF loop. Check the stack directly.
+bool hostAcceptsReports() {
+  return tud_ready() && tud_hid_ready();
 }
 
-// True when log lines should be emitted. Adafruit_USBD_CDC::operator bool()
-// reports whether the host has the port connected, so a headless keyboard never
+// Count tags whose key is currently down. An HID boot keyboard reports at most
+// kMaxSimultaneousKeys keycodes, so further presses would be silently dropped.
+uint8_t heldKeyCount() {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
+    if (gTable[i].used && gTable[i].keyHeld) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+// Modifiers that must stay down because some other held key still needs them.
+// Releasing the last user of a bit clears it from the report.
+uint8_t modifiersInUseExcept(uint8_t skipIndex) {
+  uint8_t inUse = 0;
+  for (uint8_t i = 0; i < app::MAX_TRACKED_UIDS; ++i) {
+    if (i == skipIndex || !gTable[i].used || !gTable[i].keyHeld) {
+      continue;
+    }
+    uint8_t keycode = 0;
+    uint8_t modifier = 0;
+    if (findKey(gTable[i].uid, gTable[i].len, keycode, modifier)) {
+      inUse |= modifier;
+    }
+  }
+  return inUse;
+}
+
+// Press a mapped key the instant its tag is detected. Returns true when the
+// report reached the host, so the caller only records the press on success.
+bool pressKey(uint8_t keycode, uint8_t modifier) {
+  if (app::DEBUG_MODE || !hostAcceptsReports()) {
+    return false;
+  }
+  if (heldKeyCount() >= kMaxSimultaneousKeys) {
+    return false;  // No free keycode slot in the boot keyboard report.
+  }
+  for (uint8_t bit = 0; bit < 8; ++bit) {
+    if (modifier & (1U << bit)) {
+      Keyboard.press(static_cast<uint8_t>(128 + bit));
+    }
+  }
+  Keyboard.press(keyToLibrary(keycode));
+  return true;
+}
+
+// Release one tag's key. Modifier bits are dropped only when no other held tag
+// still needs them, so tags that share Shift do not release it early.
+void releaseEntryKey(uint8_t index) {
+  if (app::DEBUG_MODE || !gTable[index].keyHeld) {
+    return;
+  }
+  uint8_t keycode = 0;
+  uint8_t modifier = 0;
+  if (!findKey(gTable[index].uid, gTable[index].len, keycode, modifier)) {
+    return;
+  }
+  Keyboard.release(keyToLibrary(keycode));
+  const uint8_t keep = modifiersInUseExcept(index);
+  for (uint8_t bit = 0; bit < 8; ++bit) {
+    const uint8_t mask = static_cast<uint8_t>(1U << bit);
+    if ((modifier & mask) && !(keep & mask)) {
+      Keyboard.release(static_cast<uint8_t>(128 + bit));
+    }
+  }
+}
+
+// True when log lines should be emitted. SerialUSB::operator bool() reports
+// whether the host has the CDC port connected, so a headless keyboard never
 // stalls on a full USB TX buffer, and debug mode still logs normally.
 bool loggingEnabled() {
   return static_cast<bool>(Serial);
@@ -256,28 +307,51 @@ void readAntenna(bool antennaA, SweepResult &sweep) {
 
   if (count > 0U) {
     // Press first: the HID report is independent of the RF stage, so do it
-    // before the field-off transaction rather than after.
-    if (!app::DEBUG_MODE && !gKeyHeld) {
-      uint8_t keycode = 0;
-      uint8_t modifier = 0;
-      for (uint8_t i = 0; i < count; ++i) {
-        uint8_t len = gTags[i].nfcId1Len;
-        if (len > kMaxUidLen) {
-          len = kMaxUidLen;
-        }
-        if (findKey(gTags[i].nfcId1, len, keycode, modifier)) {
-          pressKey(gTags[i].nfcId1, len, keycode, modifier);
-          break;
-        }
-      }
-    }
-
+    // before the field-off transaction rather than after. One key per mapped
+    // tag, so up to kMaxSimultaneousKeys tags each press their own key.
     for (uint8_t i = 0; i < count; ++i) {
       uint8_t len = gTags[i].nfcId1Len;
       if (len > kMaxUidLen) {
         len = kMaxUidLen;
       }
       appendUid(sweep, gTags[i].nfcId1, len);
+    }
+
+    if (!app::DEBUG_MODE) {
+      for (uint8_t i = 0; i < sweep.count; ++i) {
+        const uint8_t *p = &sweep.tags[i * (kMaxUidLen + 1)];
+        const uint8_t len = *p;
+
+        // Find or create the entry now, so the press can be recorded on it and
+        // a tag that stays present is never pressed twice.
+        uint8_t idx = findEntry(p + 1, len);
+        if (idx == app::MAX_TRACKED_UIDS) {
+          idx = allocEntry();
+          if (idx == app::MAX_TRACKED_UIDS) {
+            continue;  // Table full; the tag is still logged below.
+          }
+          TrackedUid &entry = gTable[idx];
+          entry.used = true;
+          entry.reported = false;
+          entry.lastReportedA = false;
+          entry.lastReportedB = false;
+          entry.absentRounds = 0;
+          entry.keyHeld = false;
+          entry.len = len;
+          memcpy(entry.uid, p + 1, len);
+        }
+
+        TrackedUid &entry = gTable[idx];
+        if (entry.keyHeld) {
+          continue;  // Already down from an earlier sweep.
+        }
+
+        uint8_t keycode = 0;
+        uint8_t modifier = 0;
+        if (findKey(entry.uid, entry.len, keycode, modifier)) {
+          entry.keyHeld = pressKey(keycode, modifier);
+        }
+      }
     }
   }
 
@@ -392,12 +466,10 @@ void updatePresence(const SweepResult &sweepA, const SweepResult &sweepB) {
         ++entry.absentRounds;
       }
       if (entry.absentRounds >= app::ABSENT_ROUNDS_BEFORE_REMOVE) {
-        // Release before forgetting the entry: only the tag that produced the
-        // press may end it, so another tag going away leaves the key held.
-        if (gKeyHeld && entry.len == gHeldUidLen &&
-            memcmp(entry.uid, gHeldUid, entry.len) == 0) {
-          releaseKey();
-        }
+        // Release this tag's key before forgetting the entry. Modifier bits that
+        // other held tags still need stay down.
+        releaseEntryKey(i);
+        entry.keyHeld = false;
         if (entry.reported) {
           reportRemoved(entry);
         }
@@ -430,11 +502,12 @@ void setup() {
   pinMode(board::PIN_ANT_B, OUTPUT);
   delayMicroseconds(app::ANTENNA_SETTLE_US);
 
-  // In keyboard mode the HID interface must be added before the USB device
-  // starts, so the descriptor advertises both CDC and HID. Debug mode leaves
-  // the interface out entirely, keeping the board serial-only.
+  // In keyboard mode the HID interface must be registered before the host
+  // enumerates, so the descriptor advertises both CDC and HID. Keyboard_::begin
+  // handles that through the core's native USB stack. Debug mode never touches
+  // it, so the board stays serial-only.
   if (!app::DEBUG_MODE) {
-    gKeyboard.begin();
+    Keyboard.begin();
   }
 
   Serial.begin(115200);
@@ -447,7 +520,7 @@ void setup() {
     // Block before the banner so the host sees it from the first line. Waiting
     // for input rather than merely for connection also guards against a port
     // that opens and closes again while the board is enumerating.
-    // Adafruit_USBD_CDC::available() yields internally, which services USB, so
+    // SerialUSB::available() services USB in the background, so
     // this loop does not stall enumeration.
     while (!Serial.available()) {
     }

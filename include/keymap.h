@@ -8,6 +8,11 @@
 // the tag is present. Tags missing from this table produce no keyboard events
 // at all; they only show up in the debug log.
 //
+// Up to six entries may be held at the same time (six keycode slots in the HID
+// boot-keyboard report) while any number of modifier bits ride along. Entries
+// sharing a modifier are handled correctly: Shift stays down until the last tag
+// that needs it is removed.
+//
 // HID keycodes are the raw values from the USB HID Usage Tables, chapter 7,
 // "Keyboard/Keypad Page (0x07)". Common values:
 //
