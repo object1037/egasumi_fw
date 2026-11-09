@@ -17,7 +17,7 @@ constexpr uint8_t MAX_TRACKED_UIDS = 64;
 
 // TLP3906 photovoltaic coupler: ton 0.2 ms typ, toff 0.3 ms typ, 1 ms max.
 // The board drives the coupler LEDs at about 17 mA, so 1 ms is conservative.
-constexpr uint32_t ANTENNA_SETTLE_US = 1000;
+constexpr uint32_t ANTENNA_SETTLE_US = 250;
 
 // Number of complete A+B rounds a tracked UID must be missing before it is
 // reported as removed. Two rounds absorb a single missed read without
