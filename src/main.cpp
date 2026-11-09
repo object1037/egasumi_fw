@@ -329,6 +329,19 @@ void setup() {
     delay(10);
   }
 
+  if (app::WAIT_FOR_SERIAL_INPUT) {
+    // Block before the banner so the host sees it from the first line. Waiting
+    // for input rather than merely for connection also guards against a port
+    // that opens and closes again while the board is enumerating.
+    // Adafruit_USBD_CDC::available() yields internally, which services USB, so
+    // this loop does not stall enumeration.
+    while (!Serial.available()) {
+    }
+    while (Serial.available()) {
+      Serial.read();  // Discard the wake-up bytes so the log starts clean.
+    }
+  }
+
   Serial.println();
   Serial.println("EGASUMI NFC READER");
   Serial.println("ST25R300, NFCA 106 kbps, differential antenna, SPI 10 MHz");

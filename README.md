@@ -81,6 +81,11 @@ At boot the firmware prints the ST25R300 IC ID, the differential antenna mode
 result, the NFCA poller initialization result, and a rough amplitude/phase
 measurement for each antenna.
 
+With `WAIT_FOR_SERIAL_INPUT` enabled (the default), nothing is printed and RF
+does not start until the host sends any character. Open the serial monitor and
+press Enter once; the banner then appears in full instead of being lost to a
+port that was not attached yet. Set the flag to `false` to boot immediately.
+
 ## Timing
 
 - SPI: 10 MHz (ST25R300 maximum).

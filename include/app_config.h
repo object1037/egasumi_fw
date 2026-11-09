@@ -27,6 +27,11 @@ constexpr uint8_t ABSENT_ROUNDS_BEFORE_REMOVE = 2;
 // Read and print the chip ID and per-antenna amplitude/phase at boot.
 constexpr bool ENABLE_RF_DIAGNOSTICS = true;
 
+// When true, setup() prints nothing until the host sends any character. This
+// keeps the boot banner from being lost before a serial monitor attaches.
+// While active, RF does not start until the host responds either.
+constexpr bool WAIT_FOR_SERIAL_INPUT = true;
+
 // Wait up to this long for the USB serial host before starting RF.
 constexpr uint32_t USB_WAIT_MS = 1500;
 
