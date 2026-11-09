@@ -45,22 +45,54 @@ listen-mode helpers that are not present in NFC-RFAL 2.0.2.
 
 The resulting image is `.pio/build/pico2/firmware.uf2`.
 
+## Modes
+
+`DEBUG_MODE` in `include/app_config.h` selects the behavior at compile time.
+
+| | `DEBUG_MODE = true` | `DEBUG_MODE = false` |
+| --- | --- | --- |
+| USB device | CDC serial only | CDC serial **and** HID keyboard |
+| Key events | never emitted | mapped tags press/hold a key |
+| Boot | waits for a character (banner preserved) | starts immediately |
+
+The keyboard device is absent from the descriptor in debug mode, so a debug
+build can never type into the host machine.
+
+### Keyboard mode
+
+A mapped UID presses its key as soon as an antenna sweep finds it, before the
+other coil is read, so detection latency is one sweep plus one HID report. The
+key stays held while the tag remains readable and is released once the tag has
+been absent for `ABSENT_ROUNDS_BEFORE_REMOVE` complete rounds.
+
+Only one key is held at a time, matching HID boot-keyboard semantics. If two
+mapped tags are present, the first one keeps the key; the second is logged but
+ignored until the first is released.
+
+Unregistered tags never produce key events. They appear in the log only.
+
 ## Serial output
 
-USB CDC. Lines are emitted only when presence changes:
+USB CDC, in both modes. Lines are emitted only when presence changes:
 
 ```
-[+] 04A1B2C3D4E5F6 AB
+[+] 04A1B2C3D4E5F6 AB key=0x05 mod=0x02
 [+] 04B1C2D3E4F5A6 A
-[-] 04A1B2C3D4E5F6
+[-] 04A1B2C3D4E5F6 key=0x05 mod=0x02
 ```
 
 - `[+] <UID> <A|B|AB>`: the UID was not previously readable; the label says
   which coil(s) answered during the round in which it appeared.
   `AB` means both coils detected the tag.
+- `key=0xNN mod=0xNN`: present for tags found in `include/keymap.h`.
+  Unregistered tags print the bare UID instead.
 - `[-] <UID>`: the UID was no longer readable on either coil.
-- UID is uppercase hex, all bytes of NFCID1 (14 digits for the 7-byte tags in
-  use).
+
+UIDs are uppercase hex, all bytes of NFCID1 (14 digits for the 7-byte tags in
+use).
+
+In keyboard mode the log is suppressed while no serial host is connected, so a
+standalone keyboard never stalls on a full USB transmit buffer.
 
 The label also re-reports a tag when its coil set changes, for example
 `AB` -> `A` as the tag moves out of coil B's field, or `A` -> `B` when it
@@ -75,25 +107,42 @@ A UID must be missing for `ABSENT_ROUNDS_BEFORE_REMOVE` complete A+B rounds
 (default 2) before `[-]` is emitted. A single missed read therefore does not
 produce a spurious `[-]` / `[+]` pair when the tag is still present.
 
+## UID to key mapping
+
+The map lives in `include/keymap.h` and is intentionally empty. Add entries as
+the panel's tag UIDs become known:
+
+```cpp
+constexpr Entry ENTRIES[] = {
+    { {0x04,0xA1,0xB2,0xC3,0xD4,0xE5,0xF6}, 7, 0x05, 0x02 },  // B with Shift
+};
+```
+
+Fields are `uid`, `len`, `keycode`, `modifier`. Keycodes and modifier bits are
+the raw USB HID values documented at the top of that header. Every UID must be
+listed in full; there is no prefix matching.
+
 ## Boot output
 
 At boot the firmware prints the ST25R300 IC ID, the differential antenna mode
 result, the NFCA poller initialization result, and a rough amplitude/phase
 measurement for each antenna.
 
-With `WAIT_FOR_SERIAL_INPUT` enabled (the default), nothing is printed and RF
-does not start until the host sends any character. Open the serial monitor and
-press Enter once; the banner then appears in full instead of being lost to a
-port that was not attached yet. Set the flag to `false` to boot immediately.
+With `WAIT_FOR_SERIAL_INPUT` enabled (the default, tied to `DEBUG_MODE`),
+nothing is printed and RF does not start until the host sends any character.
+Open the serial monitor and press Enter once; the banner then appears in full
+instead of being lost to a port that was not attached yet.
 
 ## Timing
 
 - SPI: 10 MHz (ST25R300 maximum).
-- Antenna switch settle: 1 ms (TLP3906 worst-case `toff`).
+- Antenna switch settle: `ANTENNA_SETTLE_US`, currently 250 us.
 - NFC-A guard time after field-on: RFAL `RFAL_GT_NFCA`, 5 ms, waited once per
   field-on cycle. The RF field is off while the antenna path changes.
 - Maximum tags per sweep: 32.
-- Removal latency: up to 2 complete A+B rounds, about 240 ms with a few tags.
+- Key press latency: one sweep (field on, 5 ms GT, collision resolution) plus
+  one 1 ms HID poll interval, measured from the sweep that first sees the tag.
+- Key release latency: up to 2 complete A+B rounds.
 
 ## Status
 
